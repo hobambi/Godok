@@ -7,22 +7,17 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpSession;
-
-import org.springframework.http.ResponseEntity;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.baechu.book.dto.BookListDto;
+import com.baechu.book.dto.CursorBookDto;
 import com.baechu.book.dto.FilterDto;
 import com.baechu.book.entity.Book;
 import com.baechu.book.repository.BookDSLRepository;
 import com.baechu.book.repository.BookRepository;
-import com.baechu.common.dto.BaseResponse;
-import com.baechu.common.exception.CustomException;
-import com.baechu.common.exception.ErrorCode;
-import com.baechu.common.exception.SuccessCode;
 
 import lombok.RequiredArgsConstructor;
 
@@ -31,6 +26,7 @@ import lombok.RequiredArgsConstructor;
 public class BookService {
 	private final BookRepository bookRepository;
 	private final BookDSLRepository bookDSLRepository;
+	private final RedisTemplate redisTemplate;
 
 	@Transactional(readOnly = true)
 	public Map<String, Object> bookdetail(Long bookid) {
@@ -46,15 +42,21 @@ public class BookService {
 		info.put("publish", book.getPublish());
 		String birth = book.getYear() + "년 " + book.getMonth() + "월";
 		info.put("birth", birth);
-		info.put("inventory", book.getInventory());
 
+		String bookKey = "b"+bookid;
+		ValueOperations<String, String> values = redisTemplate.opsForValue();
+		if (values.get(bookKey)==null){
+			info.put("inventory", book.getInventory());
+		}else {
+			info.put("inventory", values.get(bookKey).split(",")[1]);
+		}
 		return info;
 	}
 
 	// Cursor 기반 페이징
 	@Transactional(readOnly = true)
 	public BookListDto searchByCursor(FilterDto filter) {
-		Book lastBook = getLastBook(filter.getCursor());
+		CursorBookDto lastBook = getLastBook(filter);
 		List<Book> books = bookDSLRepository.searchByCursor(filter, lastBook);
 		Long cursor = getCursor(books, filter.getTotalRow());
 		return new BookListDto(books, cursor);
@@ -64,47 +66,33 @@ public class BookService {
 	public List<Book> bookList() {
 
 		List<Book> bookList = new ArrayList<>();
-		Long random;
-		Random r = new Random();
+		ValueOperations<String, List<Integer>> values = redisTemplate.opsForValue();
 
-		for (int i = 0; i < 8; i++) {
-			random = (long)r.nextInt(4000000);
-			Optional<Book> book = bookRepository.findById(random);
-			if (book.isPresent()) {
+		if (values.get("rank")==null){
+			Long random;
+			Random r = new Random();
+
+			for (int i = 0; i < 8; i++) {
+				random = (long)r.nextInt(4000000);
+				Optional<Book> book = bookRepository.findById(random);
+				if (book.isPresent()) {
+					bookList.add(book.get());
+				} else
+					i--;
+			}
+		}else {
+			List<Integer> topbooks = values.get("rank");
+			for (int i : topbooks){
+				Optional<Book> book = bookRepository.findById((long)i);
 				bookList.add(book.get());
-			} else
-				i--;
+			}
 		}
 
 		return bookList;
 	}
 
-	@Transactional
-	public ResponseEntity<BaseResponse> bookOrder(Long bookId, Long bookCall, HttpServletRequest request) {
-
-		HttpSession session = request.getSession(false);
-		if (session == null) {
-			return BaseResponse.toResponseEntity(ErrorCode.Forbidden);
-		} else {
-
-			Book book = bookRepository.findById(bookId).orElseThrow(
-				() -> new CustomException(ErrorCode.BOOK_NOT_FOUND));
-
-			Long inventory = book.getInventory();
-			Long restOver = inventory - bookCall;
-			if (restOver >= 0) {
-				book.setInventory(restOver);
-			} else {
-				throw new CustomException(ErrorCode.INVALIDATION_ORDER);
-			}
-			return BaseResponse.toResponseEntity(SuccessCode.ORDER_SUCCESS);
-		}
-	}
-
-	private Book getLastBook(Long id) {
-		return bookRepository.findById(id).orElseThrow(
-			() -> new CustomException(ErrorCode.BOOK_NOT_FOUND)
-		);
+	private CursorBookDto getLastBook(FilterDto filter) {
+		return bookDSLRepository.findScore(filter.getCursor(), filter.getQuery());
 	}
 
 	private Long getCursor(List<Book> books, Integer totalRow) {
